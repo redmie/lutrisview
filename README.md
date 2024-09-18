@@ -2,7 +2,16 @@
 
 **A simple bigpicture like mode for lutris.**
 
-<!-- TODO image/video here -->
+Browse lutris games in full screen using either controller, keyboard or mouse.
+Use your computer like a video game console!
+
+## Screenshots
+
+![lutrisview-by-last-played](https://github.com/user-attachments/assets/70b2363a-61c4-42f6-8e31-3a89580cdee6)
+![lutrisview-by-name](https://github.com/user-attachments/assets/fef32b92-a800-4b37-b87f-4023c8f4d705)
+![lutrisview-by-playtime](https://github.com/user-attachments/assets/4b0807d6-9517-4a7e-87d8-4d03105c1cb7)
+
+https://github.com/user-attachments/assets/ece60e75-2ef5-430c-b3cc-86ce01fed689
 
 ## Keybindings
 
