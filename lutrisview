@@ -1,0 +1,670 @@
+#!/usr/bin/python3
+# LutrisView under Apache2/MIT license by redmie in 2024
+# See https://github.com/redmie/lutrisview
+from typing import Optional, Tuple, Dict
+from enum import Enum
+import string
+import os
+import sys
+import subprocess
+import logging
+import math
+import json
+import pygame
+from multiprocessing import Pool
+from pygame import gfxdraw
+
+
+class ExitMode(Enum):
+    DESKTOP = 1
+    SHUTDOWN = 2
+    REBOOT = 3
+
+
+class Pane(Enum):
+    LASTPLAYED = 1
+    NAME = 2
+    PLAYTIME = 3
+
+
+class LutrisGame:
+    def __init__(self, game):
+        self.id = game["id"]
+        self.slug = game["slug"]
+        self.name = game["name"]
+        self.playtime = game["playtime"] if game["playtime"] is not None else ""
+        self.lastplayed = game["lastplayed"] if game["lastplayed"] is not None else ""
+
+    def coverart_path(self):
+        """Return coverart image"""
+        # TODO robustify, take into account env vars, different file ext
+        return os.path.expanduser(f"~/.cache/lutris/coverart/{self.slug}.jpg")
+
+    def launch(self):
+        """Launch game in a blocking way"""
+        run_game_command = ["lutris", f"lutris:rungameid/{self.id}"]
+        result = subprocess.run(run_game_command, capture_output=True)
+        if result.returncode != 0:
+            logging.warn(
+                f"Command '{' '.join(run_game_command)}' failed with return code {result.returncode}"
+            )
+
+
+def guess_font_size(
+    font_path: str,
+    screen_dim_size: int,
+    target_ratio: float,
+    content: Optional[str] = None,
+    use_width: bool = False,
+) -> int:
+    target_size = int(screen_dim_size * target_ratio)
+    start_size = 40
+    font = pygame.font.Font(font_path, 40)
+    fw, fh = font.size(string.ascii_letters if content is None else content)
+    if use_width:
+        scale_factor = fw / target_size
+    else:
+        scale_factor = fh / target_size
+    return int(start_size / scale_factor)
+
+
+class GameDatabase:
+    def __init__(self, game_json_str):
+        parsed_result = json.loads(game_json_str)
+        game_list = [LutrisGame(g) for g in parsed_result]
+        self.id_to_games = {}
+        for g in game_list:
+            self.id_to_games[g.id] = g
+        self.games_by_name = sorted(game_list, key=lambda x: x.name)
+        self.games_by_playtime = sorted(
+            game_list, key=lambda x: x.playtime, reverse=True
+        )
+        self.games_by_lastplayed = sorted(
+            game_list, key=lambda x: x.lastplayed, reverse=True
+        )
+
+
+def populate_database() -> GameDatabase:
+    """List installed games"""
+    list_games_command = ["lutris", "--list-games", "--installed", "-j"]
+    result = subprocess.run(list_games_command, stdout=subprocess.PIPE, text=True)
+    if result.returncode == 0:
+        return GameDatabase(result.stdout)
+    else:
+        raise RuntimeError(
+            f"Command '{' '.join(list_games_command)}' failed with return code {result.returncode}"
+        )
+
+
+class LutrisView:
+    """LutrisView: Browse and play your lutris games with a controller in fullscreen"""
+
+    def __init__(self, translations: Dict[str, str], font_name: Optional[str] = None):
+        self.exit_type: ExitMode = ExitMode.DESKTOP
+        self.force_exit_time: Optional[int] = None
+        self.hold_left: Optional[int] = None
+        self.hold_right: Optional[int] = None
+        self.last_analog_trigger_reset = True
+        self.last_ok_trigger: int = 0
+        self.font_name = font_name
+        self.primary_color = pygame.color.Color(255, 255, 255)
+        self.background_color = pygame.color.Color(0, 0, 0)
+        self.mp_pool = Pool(processes=4)
+        self.game_database_load_handle = None
+        self.game_database: Optional[GameDatabase] = None
+        self.reload_game_database = False
+        self.all_surfaces_loaded = False
+        self.images_surfaces = {}
+        self.names_surfaces = {}
+        self.selected_by_name = 0
+        self.selected_by_playtime = 0
+        self.selected_by_lastplayed = 0
+        self.pane_in_focus = Pane.LASTPLAYED
+        self.translations = translations
+        self.current_box: Tuple[Tuple[int, int], Tuple[int, int]] = ((-2, -2), (-1, -1))
+
+    def _load_lutris_db(self) -> None:
+        if self.game_database_load_handle is None:
+            if self.game_database is None or self.reload_game_database:
+                # Schedule a refresh
+                self.game_database_load_handle = self.mp_pool.apply_async(
+                    populate_database
+                )
+                self.reload_game_database = False
+        else:
+            # Check if refresh hash finished
+            if self.game_database_load_handle.ready():
+                if self.game_database_load_handle.successful():
+                    self.game_database = self.game_database_load_handle.get()
+                    logging.debug("Lutris database loaded")
+                else:
+                    logging.error("Failed to load lutris game database")
+                # Reset handle we are finished
+                self.game_database_load_handle = None
+
+    def run(self) -> None:
+        """Run LutrisView"""
+        self._init_display()
+        self._init_splash()
+        self._main_loop()
+        self._process_exit()
+
+    def _init_display(self) -> None:
+        pygame.init()
+        assert pygame.image.get_extended()
+        pygame.display.set_caption("LutrisView")
+        # Fullscreen window of display resolution
+        self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        self.clock = pygame.time.Clock()
+        self.running = True
+        self.font_name = (
+            self.font_name
+            if self.font_name is not None
+            else pygame.font.get_default_font()
+        )
+        self.font_path = pygame.font.match_font(self.font_name)
+        self.font = pygame.font.Font(self.font_path, 40)
+        self.show_help_overlay = False
+        joystick_count = pygame.joystick.get_count()
+        self.joysticks = {}
+        for i in range(joystick_count):
+            j = pygame.joystick.Joystick(i)
+            idx = j.get_instance_id()
+            self.joysticks[idx] = j
+        if joystick_count > 0:
+            pygame.mouse.set_visible(False)
+
+    def _load_images_step(self) -> None:
+        """Load one unloaded image and returns"""
+        if self.game_database is not None and not self.all_surfaces_loaded:
+            for k in self.game_database.id_to_games.keys():
+                if k not in self.images_surfaces.keys():
+                    # We load an image only to avoid blocking render loop
+                    try:
+                        self.images_surfaces[k] = pygame.image.load(
+                            self.game_database.id_to_games[k].coverart_path()
+                        ).convert()
+                    except FileNotFoundError:
+                        # Default texture
+                        self.images_surfaces[k] = pygame.Surface((264, 352))
+                        self.images_surfaces[k].fill(self.primary_color)
+                    self.images_surfaces[k] = pygame.transform.smoothscale(
+                        self.images_surfaces[k], (264, 352)
+                    )
+                    sw, sh = self.images_surfaces[k].get_size()
+                    game_name = self.game_database.id_to_games[k].name
+                    font_size = guess_font_size(
+                        self.font_path, sw, 1.0, content=game_name, use_width=True
+                    )
+                    game_font = pygame.font.Font(self.font_path, font_size)
+                    self.names_surfaces[k] = game_font.render(
+                        game_name, True, self.primary_color
+                    )
+            self.all_surfaces_loaded = True
+
+    def _rotate_pane(self, forward: bool = True):
+        if self.pane_in_focus == Pane.NAME:
+            self.pane_in_focus = Pane.PLAYTIME if forward else Pane.LASTPLAYED
+        elif self.pane_in_focus == Pane.PLAYTIME:
+            self.pane_in_focus = Pane.LASTPLAYED if forward else Pane.NAME
+        else:
+            self.pane_in_focus = Pane.NAME if forward else Pane.PLAYTIME
+        # if self.pane_in_focus is Pane.LASTPLAYED:
+        #     self.pane_in_focus = Pane.NAME if forward else Pane.PLAYTIME
+        # if self.pane_in_focus is Pane.NAME:
+        #     self.pane_in_focus = Pane.PLAYTIME if forward else Pane.LASTPLAYED
+        # if self.pane_in_focus is Pane.PLAYTIME:
+        #     self.pane_in_focus = Pane.LASTPLAYED if forward else Pane.NAME
+
+    def _init_splash(self) -> None:
+        sw, sh = self.screen.get_size()
+        # Iteratively find splash font size
+        splash_font_size = guess_font_size(self.font_path, sh, 0.15)
+        logging.debug(f"Guessed font size for splash at {splash_font_size}")
+        self.splash_font = pygame.font.Font(self.font_path, splash_font_size)
+        self.splash_text_surface = self.splash_font.render(
+            "LutrisView", True, self.primary_color
+        )
+        sptw, spth = self.splash_text_surface.get_size()
+        # Centered at 85% down
+        self.splash_text_blit_position = ((sw - sptw) // 2, 85 * sh // 100 - spth // 2)
+        self.load_square_size: int = min(sh // 2, sw)
+        self.load_square_half_size: int = self.load_square_size // 2
+        self.load_square = pygame.Surface(
+            (self.load_square_size, self.load_square_size)
+        )
+        self.load_square_blit_position: Tuple[int, int] = (
+            (sw - self.load_square_size) // 2,
+            (sh - self.load_square_size) // 2,
+        )
+        self.splash_counter = 0
+        self.splash_counter_angle = 0
+        # 4s at 60Hz
+        self.splash_counter_max = 5 * 60
+        self.splash_counter_angle_max = 7 * 60
+        self.splash_rotating_angle = 69
+        self.start_splash_at = pygame.time.get_ticks()
+
+    def _display_splash(self) -> None:
+        current_radius = int(
+            (
+                0.85
+                + 0.15
+                * math.sin(2 * math.pi * self.splash_counter / self.splash_counter_max)
+            )
+            * self.load_square_size
+            / 2
+        )
+        current_angle = int(
+            360 * self.splash_counter_angle / self.splash_counter_angle_max
+        )
+        x2, y2 = self.load_square_half_size + int(
+            2.0
+            * self.load_square_half_size
+            * math.cos(2.0 * math.pi * current_angle / 360.0)
+        ), self.load_square_half_size + int(
+            2.0
+            * self.load_square_half_size
+            * math.sin(2.0 * math.pi * current_angle / 360.0)
+        )
+        x3, y3 = self.load_square_half_size + int(
+            2.0
+            * self.load_square_half_size
+            * math.cos(
+                2.0 * math.pi * (current_angle + self.splash_rotating_angle) / 360.0
+            )
+        ), self.load_square_half_size + int(
+            2.0
+            * self.load_square_half_size
+            * math.sin(
+                2.0 * math.pi * (current_angle + self.splash_rotating_angle) / 360.0
+            )
+        )
+        self.load_square.fill(self.background_color)
+        gfxdraw.aacircle(
+            self.load_square,
+            self.load_square_size // 2,
+            self.load_square_size // 2,
+            current_radius,
+            self.primary_color,
+        )
+        gfxdraw.filled_circle(
+            self.load_square,
+            self.load_square_size // 2,
+            self.load_square_size // 2,
+            current_radius,
+            self.primary_color,
+        )
+        gfxdraw.aatrigon(
+            self.load_square,
+            self.load_square_size // 2,
+            self.load_square_size // 2,
+            x2,
+            y2,
+            x3,
+            y3,
+            self.background_color,
+        )
+        gfxdraw.filled_trigon(
+            self.load_square,
+            self.load_square_size // 2,
+            self.load_square_size // 2,
+            x2,
+            y2,
+            x3,
+            y3,
+            self.background_color,
+        )
+        self.screen.fill(self.background_color)
+        self.screen.blit(self.load_square, self.load_square_blit_position)
+        self.screen.blit(self.splash_text_surface, self.splash_text_blit_position)
+        self.splash_counter = (self.splash_counter + 1) % self.splash_counter_max
+        self.splash_counter_angle = (
+            self.splash_counter_angle + 1
+        ) % self.splash_counter_angle_max
+
+    def _prepare_display_help_overlay(self) -> None:
+        self.overlay_surface
+
+    def _display_help_overlay(self) -> None:
+        ws, hs = self.screen.get_size()
+        wo, ho = self.overlay_surface.get_size()
+        self.screen.blit(self.overlay_surface, ((ws - wo) // 2, (hs - ho) // 2))
+
+    def _prepare_display_library(self) -> None:
+        sw, sh = self.screen.get_size()
+        # Iteratively find splash font size
+        header_font_size = guess_font_size(self.font_path, sh, 0.07)
+        self.header_font = pygame.font.Font(self.font_path, header_font_size)
+        self.byname_surface = self.header_font.render(
+            self.translations["sorted_by_name"], True, self.primary_color
+        )
+        self.bylast_surface = self.header_font.render(
+            self.translations["sorted_by_lastplayed"], True, self.primary_color
+        )
+        self.byduration_surface = self.header_font.render(
+            self.translations["sorted_by_playtime"], True, self.primary_color
+        )
+
+    def _move_position_in_current_panel(self, value: int):
+        if self.pane_in_focus == Pane.NAME:
+            self.selected_by_name += value
+        elif self.pane_in_focus == Pane.PLAYTIME:
+            self.selected_by_playtime += value
+        else:
+            self.selected_by_lastplayed += value
+
+    def _display_library(self) -> None:
+        self.screen.fill(self.background_color)
+        assert self.game_database is not None
+        if self.pane_in_focus == Pane.NAME:
+            header_to_render = self.byname_surface
+            self._render_game_list(
+                self.game_database.games_by_name, self.selected_by_name
+            )
+        elif self.pane_in_focus == Pane.PLAYTIME:
+            header_to_render = self.byduration_surface
+            self._render_game_list(
+                self.game_database.games_by_playtime, self.selected_by_playtime
+            )
+        else:
+            header_to_render = self.bylast_surface
+            self._render_game_list(
+                self.game_database.games_by_lastplayed, self.selected_by_lastplayed
+            )
+        self.screen.blit(header_to_render, (30, 30))
+
+    def _launch_game(self) -> None:
+        # Inhibit launch just after exiting
+        if pygame.time.get_ticks() - self.last_ok_trigger < 500:
+            return
+        if self.game_database is not None:
+            if self.pane_in_focus == Pane.NAME:
+                game = self.game_database.games_by_name[self.selected_by_name]
+            elif self.pane_in_focus == Pane.PLAYTIME:
+                game = self.game_database.games_by_playtime[self.selected_by_playtime]
+            else:
+                game = self.game_database.games_by_lastplayed[
+                    self.selected_by_lastplayed
+                ]
+            game.launch()
+            self.reload_game_database = True
+            self.selected_by_lastplayed = 0
+            self.selected_by_playtime = 0
+            self.last_ok_trigger = pygame.time.get_ticks()
+
+    def _render_game_list(self, game_list, in_focus):
+        sw, sh = self.screen.get_size()
+        wspacer = int(sw * 0.02)
+        hspacer = int(sh * 0.02)
+        position_w = 40
+        i = in_focus
+        first_displayed = True
+        while position_w < sw:
+            game_id = game_list[i % len(game_list)].id
+            s = self.images_surfaces[game_id]
+            iw, ih = s.get_size()
+            self.screen.blit(s, (position_w, (sh - ih) // 2))
+            if first_displayed:
+                # Update click box for mouse
+                self.current_box = (
+                    (position_w, (sh - ih) // 2),
+                    (position_w + iw, (sh + ih) // 2),
+                )
+                x1, y1 = position_w + iw // 2, (sh - ih) // 2 - hspacer
+                x2, y2 = position_w + int(4 * iw / 5), (sh - ih) // 2 - 5 * hspacer
+                x3, y3 = position_w + int(iw / 5), (sh - ih) // 2 - 5 * hspacer
+                gfxdraw.aatrigon(
+                    self.screen, x1, y1, x2, y2, x3, y3, self.primary_color
+                )
+                gfxdraw.filled_trigon(
+                    self.screen, x1, y1, x2, y2, x3, y3, self.primary_color
+                )
+                first_displayed = False
+            # Mark first in list
+            if i == 0:
+                x1, y1 = position_w - int(4 * wspacer / 5), (sh - ih) // 2
+                x2, y2 = position_w - int(4 * wspacer / 5), (sh + ih) // 2
+                x3, y3 = position_w - int(1 * wspacer / 5), sh // 2
+                gfxdraw.aatrigon(
+                    self.screen, x1, y1, x2, y2, x3, y3, self.primary_color
+                )
+                gfxdraw.filled_trigon(
+                    self.screen, x1, y1, x2, y2, x3, y3, self.primary_color
+                )
+            text_blit_h = (sh + ih) // 2 + hspacer
+            self.screen.blit(self.names_surfaces[game_id], (position_w, text_blit_h))
+            position_w += iw + wspacer
+            i += 1
+
+    def _forced_exit_check(self) -> None:
+        if self.force_exit_time:
+            elapsed_ms = pygame.time.get_ticks() - self.force_exit_time
+            if elapsed_ms > 1500:
+                logging.info("Triggering forced exit")
+                self.running = False
+
+    def _handle_long_press(self) -> None:
+        self._forced_exit_check()
+        # Check if we are holding left or right and speed on the side
+        if self.hold_right:
+            elapsed_ms = pygame.time.get_ticks() - self.hold_right
+            if elapsed_ms > 500:
+                self._move_position_in_current_panel(1)
+                self.hold_right = pygame.time.get_ticks() - 350
+        if self.hold_left:
+            elapsed_ms = pygame.time.get_ticks() - self.hold_left
+            if elapsed_ms > 500:
+                self._move_position_in_current_panel(-1)
+                self.hold_left = pygame.time.get_ticks() - 350
+
+    def _handle_joystick_events(self, event) -> None:
+        if event.type == pygame.JOYBUTTONUP:
+            # B
+            if event.button == 1:
+                self.force_exit_time = None
+        if event.type == pygame.JOYBUTTONDOWN:
+            # A
+            if event.button == 0:
+                self._launch_game()
+            # B
+            if event.button == 1:
+                self.force_exit_time = pygame.time.get_ticks()
+            # X
+            if event.button == 2:
+                self._rotate_pane(forward=False)
+            # Y
+            if event.button == 3:
+                self._rotate_pane(forward=True)
+            # LB
+            if event.button == 4:
+                self._rotate_pane(forward=False)
+            # RB
+            if event.button == 5:
+                self._rotate_pane(forward=True)
+        if event.type == pygame.JOYHATMOTION:
+            left_right, _ = event.value
+            left_down = left_right == -1
+            right_down = left_right == 1
+            reset = left_right == 0
+            if right_down:
+                self._move_position_in_current_panel(1)
+                self.hold_right = pygame.time.get_ticks()
+            if left_down:
+                self._move_position_in_current_panel(-1)
+                self.hold_left = pygame.time.get_ticks()
+            if reset:
+                self.hold_right = None
+                self.hold_left = None
+        if event.type == pygame.JOYAXISMOTION:
+            # Right joystick left-right axis
+            if event.axis == 3:
+                right_down = event.value > 0.75
+                left_down = event.value < -0.75
+                reset = not right_down and not left_down
+                if right_down and self.last_analog_trigger_reset:
+                    self._move_position_in_current_panel(1)
+                    self.hold_right = pygame.time.get_ticks()
+                    self.last_analog_trigger_reset = False
+                if left_down and self.last_analog_trigger_reset:
+                    self._move_position_in_current_panel(-1)
+                    self.hold_left = pygame.time.get_ticks()
+                    self.last_analog_trigger_reset = False
+                if reset:
+                    self.hold_right = None
+                    self.hold_left = None
+                    self.last_analog_trigger_reset = True
+        if event.type == pygame.JOYDEVICEREMOVED:
+            idx = event.instance_id
+            self.joysticks[idx].quit()
+            del self.joysticks[idx]
+            # Reset left/right on disconnect
+            self.hold_right = None
+            self.hold_left = None
+            if len(self.joysticks) == 0:
+                pygame.mouse.set_visible(True)
+        if event.type == pygame.JOYDEVICEADDED:
+            idx = event.device_index
+            j = pygame.joystick.Joystick(idx)
+            idx = j.get_instance_id()
+            self.joysticks[idx] = j
+            pygame.mouse.set_visible(False)
+
+    def _handle_keyboard_events(self, event) -> None:
+        if event.type == pygame.KEYUP:
+            if event.key == pygame.K_ESCAPE:
+                self.force_exit_time = None
+            if event.key == pygame.K_RIGHT:
+                self.hold_right = None
+            if event.key == pygame.K_LEFT:
+                self.hold_left = None
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                self.force_exit_time = pygame.time.get_ticks()
+            if event.key == pygame.K_RIGHT:
+                self._move_position_in_current_panel(1)
+                self.hold_right = pygame.time.get_ticks()
+            if event.key == pygame.K_LEFT:
+                self._move_position_in_current_panel(-1)
+                self.hold_left = pygame.time.get_ticks()
+            if event.key == pygame.K_DOWN:
+                self._rotate_pane(forward=True)
+            if event.key == pygame.K_UP:
+                self._rotate_pane(forward=False)
+            if event.key == pygame.K_RETURN:
+                self._launch_game()
+
+    def _handle_mouse(self, event) -> None:
+        if event.type == pygame.MOUSEBUTTONUP:
+            # Interaction with the mouse ensure it is visible
+            pygame.mouse.set_visible(True)
+            # Right click to change pane
+            # Do not click with invisible mouse
+            if not pygame.mouse.get_visible():
+                return
+            if event.button == 3:
+                self._rotate_pane(forward=True)
+            if event.button == 1:
+                x, y = event.pos
+                print(self.current_box)
+                C1, C2 = self.current_box
+                x1, y1 = C1
+                x2, y2 = C2
+                # Launch if click on selected cover
+                if x1 <= x and y1 <= y and x <= x2 and y <= y2:
+                    self._launch_game()
+        if event.type == pygame.MOUSEWHEEL:
+            # Interaction with the mouse ensure it is visible
+            pygame.mouse.set_visible(True)
+            move = int(event.y * (1 if event.flipped else -1))
+            self._move_position_in_current_panel(move)
+
+    def _handle_events(self) -> None:
+        # poll for events
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.running = False
+            # do not handle anything else before splashscreen end
+            if self.all_surfaces_loaded:
+                self._handle_keyboard_events(event)
+                self._handle_joystick_events(event)
+                self._handle_mouse(event)
+
+    def _main_loop(self) -> None:
+        self.in_splash = True
+        while self.running:
+            self._load_lutris_db()
+            self._handle_events()
+            # Display splash during loading and at least 2 seconds
+            if (
+                self.game_database is None
+                or not self.all_surfaces_loaded
+                or pygame.time.get_ticks() - self.start_splash_at < 2000
+            ):
+                self._display_splash()
+                if self.game_database is not None:
+                    self._prepare_display_library()
+                    self._load_images_step()
+            else:
+                self._display_library()
+            # flip() the display to put your work on screen
+            pygame.display.flip()
+            self._handle_long_press()
+            self.clock.tick(60)  # limits FPS to 60
+
+    def _process_exit(self):
+        """Final call after exiting main loop"""
+        logging.info("Processing exit")
+        match self.exit_type:
+            case ExitMode.DESKTOP:
+                pass
+            case ExitMode.SHUTDOWN:
+                logging.info("Shutting down...")
+                status = subprocess.check_output(["systemctl", "poweroff"])
+                if status != 0:
+                    logging.error(
+                        "Failed to shut down using systemctl, return code {status}"
+                    )
+            case ExitMode.SHUTDOWN:
+                logging.info("Rebooting...")
+                status = subprocess.check_output(["systemctl", "reboot"])
+                if status != 0:
+                    logging.error(
+                        "Failed to reboot using systemctl, return code {status}"
+                    )
+        pygame.quit()
+        self.mp_pool.close()
+        sys.exit(0)
+
+
+def get_translations():
+    translations = {}
+    translations["en_US"] = {
+        "sorted_by_name": "Sorted by name",
+        "sorted_by_lastplayed": "Sorted by last play date",
+        "sorted_by_playtime": "Sorted by total play time",
+    }
+    translations["de_DE"] = {
+        "sorted_by_name": "Nach Name geordnet",
+        "sorted_by_lastplayed": "Nach letztes Spiel Datum geordnet",
+        "sorted_by_playtime": "Nach Gesamtspieldauer geordnet",
+    }
+    translations["fr_FR"] = {
+        "sorted_by_name": "Trié par nom",
+        "sorted_by_lastplayed": "Trié par dernière date de jeu",
+        "sorted_by_playtime": "Trié par durée de jeu totale",
+    }
+    lang = os.environ.get("LANG", default="en_US")
+    lang = lang.split(".")[0]
+    lang = lang.split(".")[0]
+    if lang not in translations:
+        logging.info(f"LANG {lang} not found, using 'en_US'")
+        lang = "en_US"
+    return translations[lang]
+
+
+if __name__ == "__main__":
+    logging.basicConfig(format="%(levelname)s:%(message)s", level=logging.DEBUG)
+    translations = get_translations()
+    app = LutrisView(translations)
+    app.run()
