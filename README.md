@@ -54,7 +54,7 @@ Everything here supposes 3 preconditions
 
 Then download and install:
 ```bash
-mkdir -p "$HOME/.local/share/icons/hicolor/scalable/apps/" && curl -O "$HOME/.local/share/icons/hicolor/scalable/apps/" https://raw.githubusercontent.com/redmie/lutrisview/main/lutrisview.svg && curl -O ~/.local/bin/lutrisview https://raw.githubusercontent.com/redmie/lutrisview/main/lutrisview && chmod 755 ~/.local/bin/lutrisview && mkdir -p ~/.local/share/applications && curl -O ~/.local/share/applications/lutrisview.desktop https://raw.githubusercontent.com/redmie/lutrisview/main/lutrisview.desktop
+mkdir -p "$HOME/.local/share/icons/hicolor/scalable/apps/" && curl -o "$HOME/.local/share/icons/hicolor/scalable/apps/lutrisview.svg" https://raw.githubusercontent.com/redmie/lutrisview/main/lutrisview.svg && mkdir -p "$HOME/.local/bin" && curl -o "$HOME/.local/bin/lutrisview" https://raw.githubusercontent.com/redmie/lutrisview/main/lutrisview && chmod 755 "$HOME/.local/bin/lutrisview" && mkdir -p "$HOME/.local/share/applications" && curl -o "$HOME/.local/share/applications/lutrisview.desktop" https://raw.githubusercontent.com/redmie/lutrisview/main/lutrisview.desktop
 ```
 
 A new application named LutrisView should now be available in your application launcher.
